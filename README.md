@@ -1,29 +1,60 @@
 # iPhone Archive for Windows
 
-Open **Start iPhone Archive.cmd**. Choose a local folder or SSD, then use **Check iPhone** for a preview or **Import now** to start copying. Leave **Keep Originals** enabled in the iPhone’s Photos settings. Connect by USB, unlock the phone, and approve Trust if prompted.
+Copy photos and videos from your iPhone to a Windows PC or external drive over USB. The app saves the files it receives without converting them and never deletes anything from your iPhone.
 
-Enable **Import when iPhone connects** to check every new connection while the app is open. **Start with Windows** opens it at sign-in. Both switches are off initially. **Pause** keeps completed files and restarts any incomplete file from the beginning on the next import.
+## Get started
 
-## Folders and verification
+1. Install Python 3.12 with Tcl/Tk, and make sure `python` is on your Windows PATH.
+2. On the iPhone, choose **Settings → Apps → Photos → Transfer to Mac or PC → Keep Originals**.
+3. Connect the iPhone with a USB data cable. Unlock it and tap **Trust** if asked.
+4. Double-click [Start iPhone Archive.cmd](Start%20iPhone%20Archive.cmd). Click **Choose…** to select your archive folder or a folder on an external drive.
+5. Click **Check iPhone** to preview what needs to be read, or **Import now** to start copying. Click **Open folder** to browse your saved files in File Explorer.
 
-- Files are queued from oldest to newest using the dates visible before copying. The app uses embedded capture dates where it can read them and otherwise uses the iPhone’s dates. Undated files go into `Unknown Date`. Matching stills, motion clips, edited versions, and sidecars are grouped by their source folder and Apple filename where available. The app copies all files the iPhone exposes, including unfamiliar extensions.
-- Each connection scans the whole visible inventory. The app reuses a history match when the device, source path, persistent ID, size, and both device timestamps match. This iPhone sometimes reports new IDs. When only the ID changes and the other properties identify a single archived file, the app also compares up to the first 256 KiB over USB. A different sample or ambiguous match triggers a complete USB read and SHA-256 comparison. Missing local files are eligible for reimport. The app rehashes an archived file when its local identity or modification time changes.
-- For a full comparison with the files currently on the iPhone, use **Archive → Import with full USB checks**. It rereads matching files in full, checks the saved copies and imports any new files it finds. It takes longer than an incremental import. A quick USB sample can miss a difference later in a file, and Windows does not provide an iPhone-side SHA-256 checksum.
-- For each transfer, the app checks the reported byte count when present and matches the SHA-256 hash of the received USB bytes to the saved file. **Verify archive** recomputes every stored hash, including files whose size and timestamps did not change. Corruption or an incomplete transfer produces an error. The iPhone is read-only throughout.
-- The archive’s `_archive` folder contains the SQLite history and `import.log`. Keep it with the media when copying an archive to another drive. Verify both separate copies before manually deleting anything from the iPhone.
+The default folder is `C:\galary_backup\PhotoArchive`. If the earlier `Documents\PhotoArchive` exists and the new default folder does not, the app opens the earlier archive.
 
-Python 3.12 and Tk are required for the desktop app. Pillow and `ffprobe` can inspect common image and video files. ExifTool is optional for reading more embedded dates in formats such as HEIC and RAW. Original bytes and embedded metadata are kept whether or not these inspection tools are installed. Coverage is limited to files the iPhone exposes over USB.
+## How files are organised
 
-## Move the earlier archive
+The app queues items from oldest to newest using the dates the iPhone reports before copying. In the archive, files are organised **by year, then month**.
 
-**Move Earlier Archive.cmd** moves the existing `Documents\PhotoArchive` folder to `C:\galary_backup\PhotoArchive`. The operation verifies the saved files both before and after the move, keeps the history with the files, and refuses an existing destination. Close other archive windows first. The desktop menu also offers **Archive → Move earlier archive…** if you want to pick a different parent folder on the same drive. For a different physical drive, copy the entire folder and use **Verify archive** on the destination.
-
-## Command line
-
-```powershell
-python -B app.py scan --archive 'C:\galary_backup\PhotoArchive'
-python -B app.py import --archive 'C:\galary_backup\PhotoArchive'
-python -B app.py verify --archive 'C:\galary_backup\PhotoArchive'
-python -B app.py move-previous
-python -B -m unittest discover -s tests -v
+```text
+PhotoArchive/
+├── 2024/
+│   └── 12-December/
+│       └── IMG_0123.HEIC
+├── 2025/
+│   └── 06-June/
+│       ├── IMG_0456.HEIC
+│       └── IMG_0456.MOV
+├── Unknown Date/
+└── _archive/
 ```
+
+The app prefers the capture date embedded in the file, then falls back to the creation or modification date reported by the phone. It records the date and where it came from. Standalone files with no usable date go into `Unknown Date`. Recognised Live Photo components, edited versions, and sidecars are kept in the same folder when the phone exposes them. The archive covers the files available over USB, including their embedded metadata.
+
+## Avoiding duplicates and checking your files
+
+| Control | What it does |
+| --- | --- |
+| **Check iPhone** | Scans the visible library and previews what matches your history or needs to be read. Older items are checked on every scan. |
+| **Import now** | Skips known copies, spot-checks likely matches after the iPhone changes file IDs, and fully reads files it cannot confidently match. Identical content is stored once. Different files with the same name are kept separately. |
+| **Verify archive** | Recalculates the SHA-256 hash of every saved file and reports missing or damaged copies. You can run it with the phone disconnected. |
+| **Archive → Import with full USB checks** | Reads matching files from the phone in full, checks the corresponding saved copies, and imports new files. This takes longer than a normal import. |
+
+Every new transfer is checked against the bytes received over USB before it enters the archive. A spot check compares the start of a file. Use full USB checks when you want a complete comparison with the files the iPhone currently exposes.
+
+## Automatic imports and recovery
+
+- Turn on **Import when iPhone connects** to start an import when the phone connects while the app is open. Turn on **Start with Windows** to open the app at sign-in. Both switches start off.
+- Click **Pause** if you need to stop. Completed files stay recorded. The next import restarts any incomplete file from the beginning.
+- If the phone is connected but nothing appears, unlock it and reconnect it while unlocked. Approve **Trust** if asked. Choose **Archive → Open import log** to see transfer details or errors.
+- The app can read more embedded dates if Pillow, `ffprobe`, or ExifTool is installed. ExifTool is useful for HEIC and RAW photos. These tools are optional for copying and checksum verification.
+
+## Use another drive
+
+Finish or pause the import, then copy the entire `PhotoArchive` folder to the new drive, including `_archive`. That folder contains the import history and log. Choose the copied folder in the app and run **Verify archive** there. Keep two verified copies on separate drives before manually removing anything from the iPhone.
+
+For the earlier `Documents\PhotoArchive` from the first version of this app, [Move Earlier Archive.cmd](Move%20Earlier%20Archive.cmd) moves it to `C:\galary_backup\PhotoArchive` on the same drive and verifies it before and after the move.
+
+## Developer documentation
+
+See the [developer guide](DEVELOPERS.md) for the CLI, architecture, and test commands.
