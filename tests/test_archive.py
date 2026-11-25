@@ -24,6 +24,7 @@ class Phone:
     def __init__(self, *entries):
         self.entries = list(entries)
         self.reads = []
+        self.bytes_read = 0
         self.after_chunk = None
 
     def list_media(self, **kwargs):
@@ -34,10 +35,14 @@ class Phone:
         self.reads.append(item.name)
         for candidate, content in self.entries:
             if candidate == item:
+                self.bytes_read += min(2, len(content))
                 yield content[:2]
                 if self.after_chunk:
                     self.after_chunk(item)
-                yield content[2:]
+                for offset in range(2, len(content), 65536):
+                    block = content[offset:offset + 65536]
+                    self.bytes_read += len(block)
+                    yield block
                 return
         raise OSError('Disconnected')
 
@@ -52,9 +57,9 @@ class ArchiveTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'Archive'
 
-    def run_import(self, phone, stop=None):
+    def run_import(self, phone, stop=None, **options):
         with patch.object(archive, 'open_iphone', phone.open):
-            return archive.import_phone(self.root, stop=stop)
+            return archive.import_phone(self.root, stop=stop, **options)
 
     def test_scans_older_additions_and_skips_verified_files_without_usb(self):
         first = Phone(media('newer.bin', 20, b'newer'))
@@ -62,12 +67,44 @@ class ArchiveTests(unittest.TestCase):
         second = Phone(media('newer.bin', 20, b'newer', object_id='different-session-id'),
                        media('old.bin', 2, b'old'), media('middle.bin', 10, b'middle'))
         with patch.object(archive, 'open_iphone', second.open):
-            known, pending = archive.preview(self.root)
+            known, to_confirm, pending = archive.preview(self.root)
         self.assertEqual(known, 1)
+        self.assertEqual(to_confirm, 0)
         self.assertEqual([item.name for item in pending], ['old.bin', 'middle.bin'])
         self.assertEqual(second.reads, [])
-        self.assertEqual(self.run_import(second), {'saved': 2, 'skipped': 1, 'duplicates': 0})
+        self.assertEqual(self.run_import(second), {'saved': 2, 'skipped': 1, 'duplicates': 0, 'spot_checked': 0})
         self.assertEqual(second.reads, ['old.bin', 'middle.bin'])
+
+    def test_changed_device_id_for_a_file_only_reads_a_sample_of_matching_bytes(self):
+        content = b'a' * (archive.PREFIX_BYTES * 3)
+        initial = Phone(media('existing.bin', 4, content, persistent_id='earlier-id'))
+        self.run_import(initial)
+        reconnected = Phone(media('existing.bin', 4, content, persistent_id='reported-new-id'))
+        with patch.object(archive, 'open_iphone', reconnected.open):
+            self.assertEqual(archive.preview(self.root), (0, 1, []))
+        self.assertEqual(self.run_import(reconnected),
+                         {'saved': 0, 'skipped': 1, 'duplicates': 0, 'spot_checked': 1})
+        self.assertGreaterEqual(reconnected.bytes_read, archive.PREFIX_BYTES)
+        self.assertLess(reconnected.bytes_read, len(content))
+        reconnected.reads.clear()
+        self.assertEqual(self.run_import(reconnected)['skipped'], 1)
+        self.assertEqual(reconnected.reads, [])
+
+    def test_different_sample_falls_back_to_a_full_read(self):
+        content = b'a' * (archive.PREFIX_BYTES + 3000)
+        self.run_import(Phone(media('same.bin', 7, content, persistent_id='earlier-id')))
+        changed = Phone(media('same.bin', 7, b'b' + content[1:], persistent_id='new-id'))
+        self.assertEqual(self.run_import(changed)['saved'], 1)
+        self.assertEqual(changed.reads, ['same.bin', 'same.bin'])
+        self.assertEqual(archive.verify(self.root), (2, 2 * len(content)))
+
+    def test_full_usb_check_detects_changes_outside_the_quick_sample(self):
+        content = b'a' * (archive.PREFIX_BYTES + 3000)
+        self.run_import(Phone(media('same.bin', 7, content)))
+        changed = Phone(media('same.bin', 7, content[:-1] + b'b'))
+        self.assertEqual(self.run_import(changed, full_usb_check=True)['saved'], 1)
+        self.assertEqual(changed.reads, ['same.bin'])
+        self.assertEqual(archive.verify(self.root), (2, 2 * len(content)))
 
     def test_deduplication_and_same_name_different_content(self):
         first = b'different contents one'
@@ -75,7 +112,7 @@ class ArchiveTests(unittest.TestCase):
         phone = Phone(media('same.bin', 1, first, folder='A'),
                       media('same.bin', 2, second, folder='B'),
                       media('repeat.bin', 3, first, folder='C'))
-        self.assertEqual(self.run_import(phone), {'saved': 2, 'skipped': 0, 'duplicates': 1})
+        self.assertEqual(self.run_import(phone), {'saved': 2, 'skipped': 0, 'duplicates': 1, 'spot_checked': 0})
         target = self.root / '2024' / '05-May'
         self.assertEqual((target / 'same.bin').read_bytes(), first)
         suffix = hashlib.sha256(second).hexdigest()[:12]
@@ -119,7 +156,7 @@ class ArchiveTests(unittest.TestCase):
         phone.after_chunk = None
         phone.reads.clear()
         resumed = self.run_import(phone)
-        self.assertEqual(resumed, {'saved': 1, 'skipped': 1, 'duplicates': 0})
+        self.assertEqual(resumed, {'saved': 1, 'skipped': 1, 'duplicates': 0, 'spot_checked': 0})
         self.assertEqual(phone.reads, ['retry.bin'])
 
     def test_rejects_incomplete_transfer(self):

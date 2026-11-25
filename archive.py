@@ -28,6 +28,7 @@ STILL = {'.heic', '.heif', '.jpg', '.jpeg', '.png', '.gif', '.dng', '.tiff', '.t
 PILLOW_FORMATS = {'.jpg', '.jpeg', '.png', '.gif', '.tiff', '.tif', '.webp'}
 SIDECAR = {'.aae', '.xmp', '.thm'}
 RESERVE = 512 * 1024**2
+PREFIX_BYTES = 256 * 1024
 LOG = logging.getLogger('iphone_archive')
 
 
@@ -164,15 +165,40 @@ def load_source_index(db, phone):
             SELECT source_path, persistent_id, source_created, source_modified, bytes, sha256, path
             FROM sightings JOIN files USING (sha256) WHERE device = ?
         ''', (device,)):
-            if persistent and created and modified and size:
-                index[path, persistent, created, modified, size].append((digest, target))
+            if created and modified and size:
+                index[path, created, modified, size].append((persistent, digest, target))
     return device, index
 
 
 def known_file(item, index):
-    matches = index.get((item.source_path, item.persistent_id, date_text(item.created),
-                         date_text(item.modified), item.size), [])
-    return matches[0] if len(matches) == 1 else None
+    matches = index.get((item.source_path, date_text(item.created), date_text(item.modified), item.size), [])
+    exact = {(digest, path) for original_id, digest, path in matches
+             if item.persistent_id and item.persistent_id == original_id}
+    if len(exact) == 1:
+        return (*next(iter(exact)), False)
+    possible = {(digest, path) for _, digest, path in matches}
+    if len(possible) == 1:
+        return (*next(iter(possible)), True)
+    return None
+
+
+def prefix_matches(phone, item, path, stop):
+    limit = min(item.size, PREFIX_BYTES)
+    with path.open('rb') as saved:
+        local = saved.read(limit)
+    if len(local) != limit:
+        raise IntegrityError(f'Could not read the expected bytes from {path}.')
+    received = bytearray()
+    with closing(phone.stream(item)) as chunks:
+        for block in chunks:
+            checkpoint(stop)
+            remaining = limit - len(received)
+            if limit == item.size and len(block) > remaining:
+                return False
+            received.extend(block[:remaining])
+            if len(received) == limit and limit < item.size:
+                break
+    return received == local
 
 
 def hash_file(path, stop=None):
@@ -331,13 +357,16 @@ def receive(phone, item, state, emit, stop, consume):
             temp.unlink(missing_ok=True)
 
 
-def store(db, root, device, item, temp, size, digest, group_folder, tools, stop):
+def store(db, root, device, item, temp, size, digest, group_folder, tools, stop, full_usb_check):
     existing = db.execute('SELECT path FROM files WHERE sha256=?', (digest,)).fetchone()
     created = False
     if existing:
         target = archive_path(root, existing[0])
         try:
-            quick_check(db, target, size, digest, stop)
+            if full_usb_check:
+                check_file(target, size, digest, stop)
+            else:
+                quick_check(db, target, size, digest, stop)
         except FileNotFoundError:
             checkpoint(stop)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -356,26 +385,33 @@ def store(db, root, device, item, temp, size, digest, group_folder, tools, stop)
             db.execute('INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)',
                        (digest, relative.as_posix(), size, date_text(capture), origin,
                         json.dumps(metadata), datetime.now(timezone.utc).isoformat()))
-        db.execute('''INSERT INTO sightings VALUES (?, ?, ?, ?, ?, ?, 0)
-                      ON CONFLICT(device, source_path, sha256) DO UPDATE SET
-                      persistent_id=excluded.persistent_id, source_created=excluded.source_created,
-                      source_modified=excluded.source_modified''',
-                   (device, item.source_path, digest, item.persistent_id,
-                    date_text(item.created), date_text(item.modified)))
+        remember_source(db, device, item, digest)
         remember_disk(db, digest, (stat.st_mtime_ns, str(stat.st_ino)))
     LOG.info('%s %s · %s bytes · SHA-256 %s', 'Saved' if created else 'Duplicate', relative, size, digest)
     return relative.parent, created
 
 
+def remember_source(db, device, item, digest):
+    db.execute('''INSERT INTO sightings VALUES (?, ?, ?, ?, ?, ?, 0)
+                  ON CONFLICT(device, source_path, sha256) DO UPDATE SET
+                  persistent_id=excluded.persistent_id, source_created=excluded.source_created,
+                  source_modified=excluded.source_modified''',
+               (device, item.source_path, digest, item.persistent_id,
+                date_text(item.created), date_text(item.modified)))
+
+
 def inventory(phone, emit, stop=None):
     items = []
+    last = time.monotonic()
     emit('status', 'Reading the iPhone inventory')
     with closing(phone.list_media(on_notice=lambda notice: emit('log', notice))) as entries:
         for item in entries:
             checkpoint(stop)
             items.append(item)
-            if len(items) % 128 == 0:
+            now = time.monotonic()
+            if now - last >= 1:
                 emit('status', f'Reading the iPhone inventory · {len(items):,} files')
+                last = now
     if not items:
         raise WpdError('No media is accessible. Unlock the iPhone, reconnect it, and tap Trust if prompted.')
     return ordered_groups(items)
@@ -395,7 +431,7 @@ def preview(root, emit=quiet, stop=None):
         else:
             index = {}
     pending = []
-    known = 0
+    known = to_confirm = 0
     for group in groups:
         for item in group:
             checkpoint(stop)
@@ -403,20 +439,23 @@ def preview(root, emit=quiet, stop=None):
             if match and archive_path(root, match[1]).is_file():
                 if archive_path(root, match[1]).stat().st_size != item.size:
                     raise IntegrityError(f'Size mismatch for {match[1]}. Run Verify archive for a full check.')
-                known += 1
+                if match[2]:
+                    to_confirm += 1
+                else:
+                    known += 1
             else:
                 pending.append(item)
-    return known, pending
+    return known, to_confirm, pending
 
 
-def import_phone(root, emit=quiet, stop=None):
+def import_phone(root, emit=quiet, stop=None, *, full_usb_check=False):
     root = validate_archive(root)
     tools = {name: shutil.which(name) for name in ('exiftool', 'ffprobe')}
     if not tools['exiftool']:
         emit('log', 'ExifTool is unavailable. HEIC and RAW may use the date reported by the iPhone.')
     if not tools['ffprobe']:
         emit('log', 'ffprobe is unavailable. Videos will be hash-checked without opening their streams.')
-    counts = dict(saved=0, skipped=0, duplicates=0)
+    counts = dict(saved=0, skipped=0, duplicates=0, spot_checked=0)
     with lock_archive(root, create=True) as state:
         handler = logging.FileHandler(state / 'import.log', encoding='utf-8')
         handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
@@ -435,24 +474,35 @@ def import_phone(root, emit=quiet, stop=None):
                         checkpoint(stop)
                         position += 1
                         match = known_file(item, index)
-                        if match:
-                            digest, relative = match
+                        if match and not full_usb_check:
+                            digest, relative, confirm = match
                             path = archive_path(root, relative)
                             try:
                                 quick_check(db, path, item.size, digest, stop)
                             except FileNotFoundError:
                                 pass  # A missing archive file is eligible for reimport.
                             else:
-                                counts['skipped'] += 1
-                                group_folder = group_folder or Path(relative).parent
-                                if position % 32 == 0 or position == total:
-                                    emit('files', (position, total, counts.copy()))
-                                continue
+                                matched = not confirm
+                                if confirm:
+                                    emit('status', f'Checking the USB match for {item.name}')
+                                    matched = prefix_matches(phone, item, path, stop)
+                                    if matched:
+                                        with db:
+                                            remember_source(db, device, item, digest)
+                                        counts['spot_checked'] += 1
+                                    else:
+                                        emit('log', f'USB sample differs for {item.name}. Reading the complete file.')
+                                if matched:
+                                    counts['skipped'] += 1
+                                    group_folder = group_folder or Path(relative).parent
+                                    if position % 32 == 0 or position == total:
+                                        emit('files', (position, total, counts.copy()))
+                                    continue
                         emit('status', f'Copying {item.name}')
                         emit('bytes', (0, item.size))
                         folder, created = receive(phone, item, state, emit, stop,
                             lambda temp, size, digest: store(db, root, device, item, temp, size, digest,
-                                                             group_folder, tools, stop))
+                                                             group_folder, tools, stop, full_usb_check))
                         group_folder = group_folder or folder
                         counts['saved' if created else 'duplicates'] += 1
                         emit('log', f'{"Saved" if created else "Duplicate"} {item.name}')

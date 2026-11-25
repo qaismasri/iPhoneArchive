@@ -180,6 +180,7 @@ class Window:
         archive_menu = tk.Menu(menu, tearoff=False)
         archive_menu.add_command(label='Open import log', command=self.open_log)
         archive_menu.add_command(label='Move earlier archive…', command=self.migrate)
+        archive_menu.add_command(label='Import with full USB checks', command=lambda: self.launch('full-import'))
         menu.add_cascade(label='Archive', menu=archive_menu)
         self.root.config(menu=menu)
 
@@ -266,7 +267,7 @@ class Window:
             return
         self.action = action
         self.stop.clear()
-        if action == 'import':
+        if action in ('import', 'full-import'):
             self.pending_auto = False
         self.status.set('Starting…')
         self.summary.set('')
@@ -284,7 +285,7 @@ class Window:
                 elif action == 'move':
                     result = (destination, *archive.move_archive(archive.PREVIOUS, destination, self.emit))
                 else:
-                    result = archive.import_phone(folder, self.emit, self.stop)
+                    result = archive.import_phone(folder, self.emit, self.stop, full_usb_check=action == 'full-import')
                 self.emit('done', (action, result))
             except archive.Paused as error:
                 self.emit('paused', str(error))
@@ -379,8 +380,9 @@ class Window:
 
     def finished(self, action, result):
         if action == 'scan':
-            known, pending = result
-            message = f'{known:,} matched the archive history. {len(pending):,} need USB reads.'
+            known, to_confirm, pending = result
+            message = (f'{known:,} history matches, {to_confirm:,} to spot-check over USB, '
+                       f'{describe(len(pending), sum(item.size or 0 for item in pending))} to read.')
             if pending:
                 self.note(f'First in date order: {pending[0].name}')
         elif action == 'verify':
@@ -392,7 +394,8 @@ class Window:
             message = f'Moved and verified · {describe(count, size)}'
         else:
             message = (f'{result["saved"]:,} saved, {result["skipped"]:,} already archived, '
-                       f'{result["duplicates"]:,} content duplicates')
+                       f'{result["duplicates"]:,} content duplicates. '
+                       f'{result["spot_checked"]:,} matches spot-checked over USB.')
         self.status.set('Complete')
         self.note(message)
         if action != 'scan':
@@ -427,6 +430,7 @@ def main():
     parser.add_argument('action', choices=('gui', 'scan', 'import', 'verify', 'move-previous'), nargs='?', default='gui')
     parser.add_argument('--archive', type=Path, default=archive.default_archive())
     parser.add_argument('--destination', type=Path, default=archive.REQUESTED)
+    parser.add_argument('--full-usb-check', action='store_true', help='During import, reread matching files over USB.')
     args = parser.parse_args()
     if args.action == 'gui':
         root = create_root()
@@ -435,12 +439,13 @@ def main():
         return 0
     try:
         if args.action == 'scan':
-            known, pending = archive.preview(args.archive, terminal)
-            print(f'{known:,} previously archived items matched, {len(pending):,} need USB reads.')
+            known, to_confirm, pending = archive.preview(args.archive, terminal)
+            print(f'{known:,} history matches, {to_confirm:,} to spot-check over USB, '
+                  f'{describe(len(pending), sum(item.size or 0 for item in pending))} to read.')
             if pending:
                 print(f'First candidate: {pending[0].name}, iPhone date {archive.source_date(pending[0])}')
         elif args.action == 'import':
-            print(archive.import_phone(args.archive, terminal))
+            print(archive.import_phone(args.archive, terminal, full_usb_check=args.full_usb_check))
         elif args.action == 'verify':
             print(f'Verified {describe(*archive.verify(args.archive, terminal))}')
         else:
